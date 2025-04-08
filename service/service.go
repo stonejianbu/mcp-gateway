@@ -6,10 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
-	"time"
 
-	"github.com/labstack/echo/v4"
 	"github.com/lucky-aeon/agentx/plugin-helper/config"
 	"github.com/lucky-aeon/agentx/plugin-helper/xlog"
 )
@@ -29,7 +26,7 @@ type McpService struct {
 	Config     config.MCPServerConfig
 	Cmd        *exec.Cmd
 	LogFile    *os.File
-	logger     echo.Logger // 用于记录CMD输出
+	logger     xlog.Logger // 用于记录CMD输出
 	StopSignal chan struct{}
 	Port       int // 添加端口字段
 
@@ -39,17 +36,13 @@ type McpService struct {
 	// 状态
 	Status string
 
-	// 所有Session
-	Sessions sync.Map
-
 	// 重试次数
 	RetryCount int
 }
 
 // NewMcpService 创建一个McpService实例
 func NewMcpService(name string, config config.MCPServerConfig, portMgr PortManagerI, cfg config.Config) *McpService {
-	logger := echo.New().Logger
-	logger.SetHeader(fmt.Sprintf("[Service-%s]", name))
+	logger := xlog.NewLogger(fmt.Sprintf("[Service-%s]", name))
 	return &McpService{
 		Name:       name,
 		Config:     config,
@@ -59,28 +52,8 @@ func NewMcpService(name string, config config.MCPServerConfig, portMgr PortManag
 		cfg:        cfg,
 		Status:     "stopped",
 		logger:     logger,
-		Sessions:   sync.Map{},
 		RetryCount: cfg.McpServiceMgrConfig.GetMcpServiceRetryCount(),
 	}
-}
-
-// AddSession 添加一个Session
-func (s *McpService) AddSession(session *Session) {
-	s.Sessions.Store(session.Id, session)
-}
-
-// GetSession 获取一个Session
-func (s *McpService) GetSession(id string) (*Session, bool) {
-	session, exists := s.Sessions.Load(id)
-	if !exists {
-		return nil, false
-	}
-	return session.(*Session), true
-}
-
-// RemoveSession 删除一个Session
-func (s *McpService) RemoveSession(id string) {
-	s.Sessions.Delete(id)
 }
 
 // IsSSE 判断是否是SSE类型
@@ -93,7 +66,7 @@ func (s *McpService) IsSSE() bool {
 }
 
 // Stop 停止服务
-func (s *McpService) Stop(logger echo.Logger) {
+func (s *McpService) Stop(logger xlog.Logger) {
 	if s.IsSSE() {
 		return
 	}
@@ -104,16 +77,18 @@ func (s *McpService) Stop(logger echo.Logger) {
 	if s.Cmd == nil {
 		return
 	}
+	if s.StopSignal != nil {
+		close(s.StopSignal)
+		s.StopSignal = nil
+	}
 	if s.LogFile != nil {
 		s.LogFile.Close()
 	}
 	if s.Cmd != nil {
 		s.Cmd.Process.Kill()
+		s.Cmd = nil
 	}
-	if s.StopSignal != nil {
-		close(s.StopSignal)
-		s.StopSignal = nil
-	}
+
 	if s.Port != 0 {
 		s.portMgr.releasePort(s.Port)
 		s.Port = 0
@@ -122,7 +97,7 @@ func (s *McpService) Stop(logger echo.Logger) {
 }
 
 // Start 启动服务
-func (s *McpService) Start(logger echo.Logger) error {
+func (s *McpService) Start(logger xlog.Logger) error {
 	if s.IsSSE() {
 		return fmt.Errorf("服务 %s 不是命令类型, 无需启动", s.Name)
 	}
@@ -170,14 +145,16 @@ func (s *McpService) Start(logger echo.Logger) error {
 	s.StopSignal = make(chan struct{})
 
 	// 启动监控
-	go s.monitorProcess()
+	go func() {
+		s.monitorProcess()
+	}()
 
 	s.Status = "running"
 	return nil
 }
 
 // Restart 重启服务
-func (s *McpService) Restart(logger echo.Logger) {
+func (s *McpService) Restart(logger xlog.Logger) {
 	if s.IsSSE() {
 		return
 	}
@@ -272,17 +249,6 @@ func (s *McpService) GetPort() int {
 
 func (s *McpService) GetStatus() string {
 	return s.Status
-}
-
-// GC长时间未使用的Session
-func (s *McpService) GC() {
-	s.Sessions.Range(func(key, value any) bool {
-		sess := value.(*Session)
-		if time.Since(sess.LastReceiveTime) > 5*s.cfg.SessionGCInterval {
-			s.Sessions.Delete(key)
-		}
-		return true
-	})
 }
 
 func (s *McpService) SendMessage(message string) error {

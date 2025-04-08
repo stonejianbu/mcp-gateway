@@ -11,10 +11,12 @@ import (
 const COMMAND_SUPERGATEWA = "/usr/local/bin/supergateway"
 
 type Config struct {
+	LogLevel            uint8         // 日志级别
 	ConfigDirPath       string        // 配置文件路径
 	Bind                string        // 绑定地址 // [::]:8080
 	Auth                *AuthConfig   // 认证配置
 	SessionGCInterval   time.Duration // Session GC间隔
+	ProxySessionTimeout time.Duration // Proxy Session 超时时间
 	McpServiceMgrConfig McpServiceMgrConfig
 
 	CommandBase string // 命令基础路径, 目前由于依赖STDIO>SSE，因此需要 COMMAND_SUPERGATEWA
@@ -54,6 +56,9 @@ func (c *Config) Default() {
 	}
 	if c.SessionGCInterval == 0 {
 		c.SessionGCInterval = 5 * time.Minute
+	}
+	if c.ProxySessionTimeout == 0 {
+		c.ProxySessionTimeout = 5 * c.SessionGCInterval // 默认为5倍GC间隔
 	}
 	if c.McpServiceMgrConfig.McpServiceRetryCount == 0 {
 		c.McpServiceMgrConfig.McpServiceRetryCount = 3

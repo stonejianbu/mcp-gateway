@@ -2,13 +2,13 @@ package router
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"sync"
 
 	"github.com/labstack/echo/v4"
 	"github.com/lucky-aeon/agentx/plugin-helper/config"
 	"github.com/lucky-aeon/agentx/plugin-helper/service"
+	"github.com/lucky-aeon/agentx/plugin-helper/xlog"
 )
 
 // ServerManager 管理所有运行的服务
@@ -18,8 +18,6 @@ type ServerManager struct {
 	cfg           config.Config
 }
 
-var manager *ServerManager
-
 // NewServerManager 初始化服务管理器
 func NewServerManager(cfg config.Config, e *echo.Echo) *ServerManager {
 	m := &ServerManager{
@@ -28,18 +26,19 @@ func NewServerManager(cfg config.Config, e *echo.Echo) *ServerManager {
 	}
 
 	// 注册路由
-	e.POST("/deploy", manager.handleDeploy)             // 部署服务
-	e.DELETE("/delete", manager.handleDeleteMcpService) // 删除服务
-	e.GET("/sse", manager.handleGlobalSSE)              // 全局SSE WIP
-	e.POST("/message", manager.handleGlobalMessage)     // 全局消息 WIP
-	e.GET("/services", manager.handleGetAllServices)    // 获取所有服务
+	e.POST("/deploy", m.handleDeploy)             // 部署服务
+	e.DELETE("/delete", m.handleDeleteMcpService) // 删除服务
+	e.GET("/sse", m.handleGlobalSSE)              // 全局SSE WIP
+	e.POST("/message", m.handleGlobalMessage)     // 全局消息 WIP
+	e.GET("/services", m.handleGetAllServices)    // 获取所有服务
 
 	// 代理
-	e.Any("/*", proxyHandler())
+	e.Any("/*", m.proxyHandler())
 	m.loadConfig()
 	return m
 }
 func (m *ServerManager) loadConfig() error {
+	xl := xlog.NewLogger("[ServerManager]")
 	data, err := os.ReadFile(m.cfg.GetMcpConfigPath())
 	if os.IsNotExist(err) {
 		return nil
@@ -54,11 +53,15 @@ func (m *ServerManager) loadConfig() error {
 	}
 
 	for name, srv := range config {
-		fmt.Printf("Loading server %s: %v\n", name, srv)
-		if err := m.DeployServer(echo.New().Logger, name, srv); err != nil {
-			fmt.Printf("Error deploying server %s: %v\n", name, err)
+		xl.Infof("Loading server %s: %v", name, srv)
+		if err := m.DeployServer(xl, name, srv); err != nil {
+			xl.Errorf("Error deploying server %s: %v", name, err)
 		}
 	}
-	fmt.Printf("Loaded %d servers\n", len(config))
+	xl.Infof("Loaded %d servers", len(config))
 	return nil
+}
+
+func (m *ServerManager) Close() {
+	m.mcpServiceMgr.Close()
 }

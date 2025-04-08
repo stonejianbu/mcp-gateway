@@ -12,6 +12,7 @@ import (
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/gommon/log"
 
 	"github.com/lucky-aeon/agentx/plugin-helper/config"
 	"github.com/lucky-aeon/agentx/plugin-helper/middleware_impl"
@@ -32,6 +33,9 @@ func main() {
 		cfg.SaveConfig()
 	}()
 
+	log.Infof("log level: %d", cfg.LogLevel)
+	log.SetLevel(log.Lvl(cfg.LogLevel))
+
 	// 创建proxy log
 	proxyLogFile, err := xlog.CreateLogFile(cfg.ConfigDirPath, "plugin-proxy.log")
 	if err != nil {
@@ -40,7 +44,6 @@ func main() {
 
 	// 创建 Echo 实例
 	e := echo.New()
-	e.Logger.SetLevel(1)
 	e.Logger.SetOutput(io.MultiWriter(proxyLogFile, os.Stdout))
 
 	// 添加中间件
@@ -49,7 +52,7 @@ func main() {
 	e.Use(middleware.KeyAuthWithConfig(middleware_impl.NewAuthMiddleware(cfg).GetKeyAuthConfig())) // API Key 鉴权
 
 	// 初始化服务管理器
-	_ = router.NewServerManager(*cfg, e)
+	srvMgr := router.NewServerManager(*cfg, e)
 
 	// 设置优雅退出
 	quit := make(chan os.Signal, 1)
@@ -68,6 +71,7 @@ func main() {
 	// 优雅关闭
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	srvMgr.Close()
 	if err := e.Shutdown(ctx); err != nil {
 		e.Logger.Fatal(err)
 	}

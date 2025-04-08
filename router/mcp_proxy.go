@@ -12,7 +12,7 @@ import (
 )
 
 // proxyHandler 返回代理处理函数
-func proxyHandler() echo.HandlerFunc {
+func (m *ServerManager) proxyHandler() echo.HandlerFunc {
 	return func(c echo.Context) error {
 		path := c.Request().URL.Path
 
@@ -27,9 +27,9 @@ func proxyHandler() echo.HandlerFunc {
 		remainingPath := "/" + strings.Join(parts[1:], "/")
 
 		// 获取服务配置
-		manager.RLock()
-		instance, err := manager.mcpServiceMgr.GetMcpService(c.Logger(), serviceName)
-		manager.RUnlock()
+		m.RLock()
+		instance, err := m.mcpServiceMgr.GetMcpService(c.Logger(), serviceName)
+		m.RUnlock()
 
 		if err != nil {
 			return c.String(http.StatusNotFound, "Service not found")

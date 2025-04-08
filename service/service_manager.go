@@ -8,20 +8,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/labstack/echo/v4"
 	"github.com/lucky-aeon/agentx/plugin-helper/config"
+	"github.com/lucky-aeon/agentx/plugin-helper/xlog"
 )
 
 type ServiceManagerI interface {
-	DeployServer(logger echo.Logger, name string, config config.MCPServerConfig) error
-	StopServer(logger echo.Logger, name string)
-	ListServerConfig(logger echo.Logger) map[string]config.MCPServerConfig
-	GetMcpService(logger echo.Logger, name string) (ExportMcpService, error)
-	GetMcpServices(logger echo.Logger) map[string]ExportMcpService
-	CreateProxySession() *Session
-	GetProxySession(id string) (*Session, bool)
-	CloseProxySession(id string)
-	DeleteServer(logger echo.Logger, name string) error
+	DeployServer(logger xlog.Logger, name string, config config.MCPServerConfig) error
+	StopServer(logger xlog.Logger, name string)
+	ListServerConfig(logger xlog.Logger) map[string]config.MCPServerConfig
+	GetMcpService(logger xlog.Logger, name string) (ExportMcpService, error)
+	GetMcpServices(logger xlog.Logger) map[string]ExportMcpService
+	CreateProxySession(logger xlog.Logger) *Session
+	GetProxySession(logger xlog.Logger, id string) (*Session, bool)
+	CloseProxySession(logger xlog.Logger, id string)
+	DeleteServer(logger xlog.Logger, name string) error
+	Close()
 }
 
 type PortManagerI interface {
@@ -59,11 +60,13 @@ func NewServiceManager(cfg config.Config) *ServiceManager {
 		sessions:      make(map[string]*McpService),
 		proxySessions: make(map[string]*Session),
 	}
-	go mgr.loopGC()
+	go func() {
+		mgr.loopGC()
+	}()
 	return mgr
 }
 
-func (m *ServiceManager) DeleteServer(logger echo.Logger, name string) error {
+func (m *ServiceManager) DeleteServer(logger xlog.Logger, name string) error {
 	m.Lock()
 	defer m.Unlock()
 	if mcpService, exists := m.servers[name]; exists {
@@ -76,7 +79,7 @@ func (m *ServiceManager) DeleteServer(logger echo.Logger, name string) error {
 	return nil
 }
 
-func (m *ServiceManager) DeployServer(logger echo.Logger, name string, config config.MCPServerConfig) error {
+func (m *ServiceManager) DeployServer(logger xlog.Logger, name string, config config.MCPServerConfig) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -99,7 +102,7 @@ func (m *ServiceManager) DeployServer(logger echo.Logger, name string, config co
 	return nil
 }
 
-func (m *ServiceManager) ListServerConfig(logger echo.Logger) map[string]config.MCPServerConfig {
+func (m *ServiceManager) ListServerConfig(logger xlog.Logger) map[string]config.MCPServerConfig {
 	m.RLock()
 	defer m.RUnlock()
 	config := make(map[string]config.MCPServerConfig)
@@ -109,7 +112,7 @@ func (m *ServiceManager) ListServerConfig(logger echo.Logger) map[string]config.
 	return config
 }
 
-func (m *ServiceManager) GetMcpService(logger echo.Logger, name string) (ExportMcpService, error) {
+func (m *ServiceManager) GetMcpService(logger xlog.Logger, name string) (ExportMcpService, error) {
 	instance, err := m.getMcpService(name)
 	if err != nil {
 		logger.Errorf("获取服务 %s 失败: %v", name, err)
@@ -127,7 +130,7 @@ func (m *ServiceManager) getMcpService(name string) (*McpService, error) {
 	return nil, fmt.Errorf("服务 %s 不存在", name)
 }
 
-func (m *ServiceManager) StopServer(logger echo.Logger, name string) {
+func (m *ServiceManager) StopServer(logger xlog.Logger, name string) {
 	mcp, err := m.getMcpService(name)
 	if err != nil {
 		logger.Errorf("获取服务 %s 失败: %v", name, err)
@@ -169,7 +172,7 @@ func (m *ServiceManager) releasePort(port int) {
 	m.portMutex.Unlock()
 }
 
-func (m *ServiceManager) GetMcpServices(logger echo.Logger) map[string]ExportMcpService {
+func (m *ServiceManager) GetMcpServices(logger xlog.Logger) map[string]ExportMcpService {
 	m.RLock()
 	defer m.RUnlock()
 	exportServices := make(map[string]ExportMcpService)
@@ -180,36 +183,44 @@ func (m *ServiceManager) GetMcpServices(logger echo.Logger) map[string]ExportMcp
 }
 
 // CreateProxySession 创建一个新的代理会话
-func (m *ServiceManager) CreateProxySession() *Session {
+func (m *ServiceManager) CreateProxySession(xl xlog.Logger) *Session {
+	xl.Infof("Creating new proxy session")
 	m.proxySessionsMutex.Lock()
 	defer m.proxySessionsMutex.Unlock()
 
+	xl.Infof("Creating new session")
 	session := NewSession(uuid.New().String())
 	m.proxySessions[session.Id] = session
 
+	xl.Infof("Subscribing to all MCP services")
 	// 订阅所有MCP服务的SSE事件
 	m.RLock()
 	for name, instance := range m.servers {
+		xl.Infof("Subscribing to MCP service: %s", name)
 		session.SubscribeSSE(name, instance.GetSSEUrl())
 	}
 	m.RUnlock()
 
+	xl.Infof("Proxy session created: %s", session.Id)
 	return session
 }
 
 // CloseProxySession 关闭代理会话
-func (m *ServiceManager) CloseProxySession(id string) {
+func (m *ServiceManager) CloseProxySession(xl xlog.Logger, id string) {
+	xl.Infof("Closing proxy session: %s", id)
 	m.proxySessionsMutex.Lock()
 	defer m.proxySessionsMutex.Unlock()
 
+	xl.Infof("Closing proxy session, has mutex: %s", id)
 	if session, exists := m.proxySessions[id]; exists {
 		session.Close()
+		xl.Infof("Closed proxy session: %s", id)
 		delete(m.proxySessions, id)
 	}
 }
 
 // GetProxySession 获取代理会话
-func (m *ServiceManager) GetProxySession(id string) (*Session, bool) {
+func (m *ServiceManager) GetProxySession(logger xlog.Logger, id string) (*Session, bool) {
 	m.proxySessionsMutex.RLock()
 	defer m.proxySessionsMutex.RUnlock()
 
@@ -221,22 +232,51 @@ func (m *ServiceManager) GetProxySession(id string) (*Session, bool) {
 func (m *ServiceManager) loopGC() {
 	tick := time.NewTicker(m.cfg.SessionGCInterval)
 	defer tick.Stop()
+	xl := xlog.NewLogger("[ServiceManager-GC]")
 
 	for range tick.C {
-		m.RLock()
-		// GC MCP services sessions
-		for _, instance := range m.servers {
-			instance.GC()
-		}
-
 		// GC proxy sessions
-		m.proxySessionsMutex.Lock()
-		for id, session := range m.proxySessions {
-			if time.Since(session.LastReceiveTime) > 5*m.cfg.SessionGCInterval {
-				delete(m.proxySessions, id)
+		func() {
+			m.proxySessionsMutex.Lock()
+			defer m.proxySessionsMutex.Unlock()
+			now := time.Now()
+			xl.Infof("GC proxy sessions, last receive time: %s. timeout: %s", now, m.cfg.ProxySessionTimeout)
+			for id, session := range m.proxySessions {
+				if session == nil {
+					delete(m.proxySessions, id)
+					continue
+				}
+				if now.Sub(session.LastReceiveTime) > m.cfg.ProxySessionTimeout {
+					xl.Infof("Closing proxy session: %s, last receive time: %s. timeout: %s", id, session.LastReceiveTime, m.cfg.ProxySessionTimeout)
+					session.Close()
+					delete(m.proxySessions, id)
+					xl.Infof("Closed proxy session: %s", id)
+				}
 			}
-		}
-		m.proxySessionsMutex.Unlock()
-		m.RUnlock()
+		}()
 	}
+}
+
+func (m *ServiceManager) Close() {
+	xl := xlog.NewLogger("[ServiceManager]")
+	m.RLock()
+	defer m.RUnlock()
+	m.proxySessionsMutex.Lock()
+	defer m.proxySessionsMutex.Unlock()
+
+	xl.Infof("Closing all proxy sessions...")
+	for id, session := range m.proxySessions {
+		if session != nil {
+			session.Close()
+		}
+		delete(m.proxySessions, id)
+	}
+
+	xl.Infof("Closing all MCP services...")
+	for name, instance := range m.servers {
+		instance.Stop(xl)
+		delete(m.servers, name)
+	}
+
+	xl.Infof("ServiceManager closed")
 }
