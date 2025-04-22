@@ -20,29 +20,15 @@ import (
 type McpName = string
 type McpToolName = string
 
-type McpMessage struct {
-	McpName McpName
-	Content string
-	Type    string // "send" or "receive"
-	Time    time.Time
-}
-
 type Session struct {
 	sync.RWMutex
 	Id              string
-	Results         []string
-	Offset          int
-	Receives        []string
-	ReceiveOffset   int       // 新增接收消息的偏移量
 	LastReceiveTime time.Time // 最后一次接收消息的时间
 
-	// 消息历史记录
-	messagesMutex sync.RWMutex
-	messages      []McpMessage
-
 	// SSE事件通道
-	eventChan chan SessionMsg
-	doneChan  chan struct{}
+	eventChans []chan SessionMsg
+	doneChan   chan struct{}
+	sendMx     sync.RWMutex
 
 	// SSE订阅
 	sseWaitGroup sync.WaitGroup
@@ -58,14 +44,15 @@ type Session struct {
 	mcpToolsMutex  sync.RWMutex
 	mcpToolsMap    map[McpName]map[McpToolName]types.McpTool
 	waitToolsCount atomic.Int32
+
+	// 避免重复返回
+	lastMsg SessionMsg
 }
 
 func NewSession(id string) *Session {
 	return &Session{
 		Id:              id,
 		LastReceiveTime: time.Now(),
-		messages:        make([]McpMessage, 0),
-		eventChan:       make(chan SessionMsg, 100), // 缓冲通道，避免阻塞
 		mcpMessageUrl:   make(map[McpName]string),
 		messageIds:      make(map[int64]int64),
 		mcpToolsMap:     make(map[McpName]map[McpToolName]types.McpTool),
@@ -74,79 +61,8 @@ func NewSession(id string) *Session {
 	}
 }
 
-func (s *Session) AddReceive(receive string) {
-	s.Lock()
-	defer s.Unlock()
-	s.Receives = append(s.Receives, receive)
-	s.LastReceiveTime = time.Now()
-}
-
-func (s *Session) AddResult(result string) {
-	s.Lock()
-	defer s.Unlock()
-	s.Results = append(s.Results, result)
-}
-
 func (s *Session) GetId() string {
 	return s.Id
-}
-
-func (s *Session) GetResults() []string {
-	s.RLock()
-	defer s.RUnlock()
-	results := make([]string, len(s.Results))
-	copy(results, s.Results)
-	return results
-}
-
-func (s *Session) GetReceives() []string {
-	s.RLock()
-	defer s.RUnlock()
-	receives := make([]string, len(s.Receives))
-	copy(receives, s.Receives)
-	return receives
-}
-
-func (s *Session) GetOffset() int {
-	s.RLock()
-	defer s.RUnlock()
-	return s.Offset
-}
-
-func (s *Session) SetOffset(offset int) {
-	s.Lock()
-	defer s.Unlock()
-	s.Offset = offset
-}
-
-// GetUnprocessedReceives 获取未处理的接收消息
-func (s *Session) GetUnprocessedReceives() []string {
-	s.Lock()
-	defer s.Unlock()
-
-	if s.ReceiveOffset >= len(s.Receives) {
-		return nil
-	}
-
-	unprocessed := make([]string, len(s.Receives)-s.ReceiveOffset)
-	copy(unprocessed, s.Receives[s.ReceiveOffset:])
-	s.ReceiveOffset = len(s.Receives)
-	return unprocessed
-}
-
-// GetUnreadResults 获取未读取的处理结果
-func (s *Session) GetUnreadResults() []string {
-	s.Lock()
-	defer s.Unlock()
-
-	if s.Offset >= len(s.Results) {
-		return nil
-	}
-
-	unread := make([]string, len(s.Results)-s.Offset)
-	copy(unread, s.Results[s.Offset:])
-	s.Offset = len(s.Results)
-	return unread
 }
 
 func (s *Session) SendMessage(xl xlog.Logger, content string) (err error) {
@@ -220,7 +136,6 @@ func (s *Session) SendMessage(xl xlog.Logger, content string) (err error) {
 		}
 	}
 
-	s.AddMessage(singleMcp, request.ToJson(), "send")
 	return nil
 }
 
@@ -276,32 +191,7 @@ func (s *Session) sendToMcp(xl xlog.Logger, mcpName McpName, request types.McpRe
 		xl.Errorf("failed to send message, status code: %d", resp.StatusCode)
 		return fmt.Errorf("failed to send message, status code: %d", resp.StatusCode)
 	}
-	s.AddMessage(mcpName, request.ToJson(), "send")
 	return nil
-}
-
-// AddMessage 添加一条消息记录
-func (s *Session) AddMessage(mcpName McpName, content string, msgType string) {
-	s.messagesMutex.Lock()
-	defer s.messagesMutex.Unlock()
-
-	s.messages = append(s.messages, McpMessage{
-		McpName: mcpName,
-		Content: content,
-		Type:    msgType,
-		Time:    time.Now(),
-	})
-}
-
-// GetMessages 获取所有消息记录
-func (s *Session) GetMessages() []McpMessage {
-	s.messagesMutex.RLock()
-	defer s.messagesMutex.RUnlock()
-
-	// 返回消息记录的副本
-	messages := make([]McpMessage, len(s.messages))
-	copy(messages, s.messages)
-	return messages
 }
 
 func (s *Session) IsReady() bool {
@@ -335,7 +225,6 @@ func (s *Session) SubscribeSSE(mcpName McpName, sseUrl string) {
 
 		defer func() {
 			s.sseConnMutex.Lock()
-			delete(s.sseConns, mcpName)
 			s.sseConnMutex.Unlock()
 
 			if err := resp.Body.Close(); err != nil {
@@ -376,10 +265,13 @@ func (s *Session) SubscribeSSE(mcpName McpName, sseUrl string) {
 						s.mcpMessageUrl[mcpName] = fmt.Sprintf("%s://%s%s", resp.Request.URL.Scheme, resp.Request.Host, data)
 					}
 
+					curMsg := SessionMsg{Event: currentEvent, Data: data}
 					if gjson.Get(data, "id").Exists() {
 						messageId := gjson.Get(data, "id").Int()
 						// 检查是否是当前会话的消息
 						realMessage, exists := s.getRealMessageId(messageId)
+						curMsg.proxyId, curMsg.clientId = messageId, realMessage
+						xl.Debugf("recevied: id(%d), clientId(%d)", messageId, realMessage)
 						if !exists {
 							continue
 						}
@@ -422,7 +314,7 @@ func (s *Session) SubscribeSSE(mcpName McpName, sseUrl string) {
 								return true
 							}()
 							if !isContinue {
-								return
+								continue
 							}
 						} else if get := gjson.Get(data, "result.serverInfo.name"); get.Exists() {
 							// handler mcpname
@@ -436,7 +328,8 @@ func (s *Session) SubscribeSSE(mcpName McpName, sseUrl string) {
 
 						// 如果不是endpoint事件，转发给客户端
 						if currentEvent != "endpoint" {
-							s.SendEvent(SessionMsg{Event: currentEvent, Data: data})
+							curMsg.Data = data
+							s.SendEvent(curMsg)
 						}
 					}
 				}
@@ -446,8 +339,24 @@ func (s *Session) SubscribeSSE(mcpName McpName, sseUrl string) {
 }
 
 type SessionMsg struct {
-	Event string `json:"event"`
-	Data  string `json:"data"`
+	proxyId  int64
+	clientId int64
+	Event    string `json:"event"`
+	Data     string `json:"data"`
+}
+
+// check lastMsg is 重复的
+func (smsg *SessionMsg) isDuplicate(newMsg *SessionMsg) bool {
+	if smsg.proxyId != 0 && smsg.proxyId == newMsg.proxyId {
+		return true
+	}
+	if smsg.clientId != 0 && smsg.clientId == newMsg.clientId {
+		return true
+	}
+	if smsg.Data == newMsg.Data {
+		return true
+	}
+	return false
 }
 
 // Close 关闭会话
@@ -472,16 +381,32 @@ func (s *Session) Close() {
 func (s *Session) SendEvent(event SessionMsg) {
 	xl := xlog.NewLogger("session-" + s.Id)
 	xl.Infof("Sending event: %s", event)
-	select {
-	case s.eventChan <- event:
-	default:
-		// 如果通道已满，丢弃事件
+	s.sendMx.RLock()
+	defer s.sendMx.RUnlock()
+
+	if s.lastMsg.isDuplicate(&event) {
+		xl.Debugf("Event already sent: %s", event.Event)
+		return
+	}
+
+	s.LastReceiveTime = time.Now()
+	for _, eventChan := range s.eventChans {
+		select {
+		case eventChan <- event:
+			s.lastMsg = event
+		default:
+			// 如果通道已满，丢弃事件
+		}
 	}
 }
 
 // GetEventChan 获取事件通道
 func (s *Session) GetEventChan() <-chan SessionMsg {
-	return s.eventChan
+	s.sendMx.Lock()
+	defer s.sendMx.Unlock()
+	curChan := make(chan SessionMsg, 100)
+	s.eventChans = append(s.eventChans, curChan)
+	return curChan
 }
 
 // GetMcpTools 获取指定 MCP 的所有工具
@@ -509,4 +434,8 @@ func (s *Session) GetMcpTool(mcpName McpName, toolName McpToolName) (types.McpTo
 		}
 	}
 	return types.McpTool{}, false
+}
+
+func (s *Session) ping() {
+
 }

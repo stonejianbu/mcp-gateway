@@ -1,6 +1,6 @@
 {
   "fetch": {
-    "command": "npx  ",
+    "command": "npx",
     "args": [
       "-y",
       "@kazuph/mcp-fetch"

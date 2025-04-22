@@ -31,10 +31,6 @@ func (m *ServerManager) handleGlobalSSE(c echo.Context) error {
 	if !exists {
 		return c.String(http.StatusNotFound, "session not found")
 	}
-	defer func() {
-		xl.Infof("Closing session: %s", session.Id)
-		m.mcpServiceMgr.CloseProxySession(xl, session.Id)
-	}()
 
 	// 返回endpoint事件
 	c.Response().WriteHeader(http.StatusOK)
